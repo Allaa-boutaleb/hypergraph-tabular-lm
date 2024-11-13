@@ -91,6 +91,11 @@ class OptimizerConfig:
     adam_w_mode: bool = True
     save_every_n_epochs: int=1
     save_top_k: int=3
+    # Added checkpoint loading
+    checkpoint_path: str = field(
+        default="",
+        metadata={"help": "Path to pretrained checkpoint for finetuning"}
+    )
     @classmethod
     def dict(self):
         return {field.name: getattr(self, field.name) for field in fields(self)}
