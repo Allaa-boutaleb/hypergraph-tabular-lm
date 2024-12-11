@@ -109,6 +109,8 @@ def json2string(exm):
     # for now only keep some (rows, columns, words) in the arrow files.
     header = [h['name'] for h in tb['header']][:MAX_COL_LEN]
     data = tb['data']
+    # convert all cells to strings
+    data = [[str(cell) for cell in row] for row in data]
 
     while len(data):
         if (header[0] and isinstance(data[0][0], list) and (header[0] in ' '.join(data[0][0]))):
@@ -136,10 +138,13 @@ def json2string(exm):
 
 
 
-def preprocess():
+def preprocess(benchmark):
+    input_dir = osp.join(f'./data/{benchmark}/', 'chunks')
+    output_dir = osp.join(f'./data/{benchmark}/', 'arrow')
 
-    input_dir = osp.join('./data/pretrain/', 'chunks')
-    output_dir = osp.join('./data/pretrain/', 'arrow')
+    print(f"Processing {benchmark} benchmark...")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {output_dir}")
 
     files = []
     for dirpath, _, filenames in os.walk(input_dir):
@@ -152,7 +157,7 @@ def preprocess():
     all_lower_heads, all_lower_cells = mg.list(), mg.list()
     pool = Pool(processes=len(files))
     for name in files:
-        pool.apply_async(read_json, args=(name, all_texts,  all_lower_heads, all_lower_cells, ))
+        pool.apply_async(read_json, args=(name, all_texts, all_lower_heads, all_lower_cells, ))
     pool.close()
     pool.join()
 
@@ -190,4 +195,11 @@ def serialize_text_to_arrow(all_text, folder, split=None):
 
 
 if __name__ == "__main__":
-    preprocess()
+    import sys
+    
+    if len(sys.argv) != 2:
+        print("Usage: python parallel_clean.py <benchmark_name>")
+        sys.exit(1)
+        
+    benchmark = sys.argv[1]
+    preprocess(benchmark)

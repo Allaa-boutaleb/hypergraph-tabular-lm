@@ -1,0 +1,8 @@
+.DS_Store
+
+**/checkpoints/
+**/data/
+**/output/
+**/vectors/
+**/results/
+**/__pycache__/**

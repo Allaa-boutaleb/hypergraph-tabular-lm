@@ -1,5 +1,8 @@
 import torch
 from layers import *
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -12,8 +15,30 @@ class Embedding(nn.Module):
     self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
   def forward(self, x_s, x_t):
+    # Add diagnostic prints
+    logger.debug(f"Input shapes - x_s: {x_s.shape}, x_t: {x_t.shape}")
+    logger.debug(f"Non-zero counts - x_s: {torch.count_nonzero(x_s, dim=1)}")
+    
     embedding_s, embedding_t = self.tok_embed(x_s), self.tok_embed(x_t)
-    embedding_s, embedding_t = torch.div(torch.sum(embedding_s, dim=1), torch.count_nonzero(x_s, dim=1).unsqueeze(-1)), torch.div(torch.sum(embedding_t, dim=1), torch.count_nonzero(x_t, dim=1).unsqueeze(-1))
+    
+    # Compute non-zero counts
+    counts_s = torch.count_nonzero(x_s, dim=1).unsqueeze(-1)
+    counts_t = torch.count_nonzero(x_t, dim=1).unsqueeze(-1)
+    
+    # Replace zero counts with ones to avoid division by zero
+    counts_s = torch.where(counts_s > 0, counts_s, torch.ones_like(counts_s))
+    counts_t = torch.where(counts_t > 0, counts_t, torch.ones_like(counts_t))
+    
+    # Compute mean embeddings
+    embedding_s = torch.div(torch.sum(embedding_s, dim=1), counts_s)
+    embedding_t = torch.div(torch.sum(embedding_t, dim=1), counts_t)
+    
+    # Check for NaNs
+    if torch.isnan(embedding_s).any() or torch.isnan(embedding_t).any():
+        logger.error("NaN values detected in embeddings!")
+        logger.error(f"Zero counts in x_s: {(counts_s == 0).sum().item()}")
+        logger.error(f"Zero counts in x_t: {(counts_t == 0).sum().item()}")
+    
     return self.dropout(self.norm(embedding_s)), self.dropout(self.norm(embedding_t))
 
 

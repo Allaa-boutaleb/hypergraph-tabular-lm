@@ -13,6 +13,7 @@ except ImportError:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from collections import OrderedDict
 
@@ -26,47 +27,113 @@ from transformers.optimization import AdamW, get_scheduler
 
 from dataclasses import dataclass, field, fields
 from typing import Optional
+import math
 
 from model import Encoder, ContrastiveLoss
 from data import TableDataModule
 
+# LoRA implementation
+class LoRALayer(nn.Module):
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int,
+        r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        
+        # LoRA weights
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+        self.scaling = self.lora_alpha / self.r
+        
+        # Dropout
+        self.lora_dropout = nn.Dropout(p=lora_dropout)
+        
+        # Initialize weights
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = (self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        return result
+
+class LoRALinear(nn.Module):
+    def __init__(
+        self,
+        linear_layer: nn.Linear,
+        r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.base_layer = linear_layer
+        self.lora = LoRALayer(
+            linear_layer.in_features,
+            linear_layer.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
+        
+        # Freeze the base layer
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base_layer(x)
+        lora_out = self.lora(x)
+        return base_out + lora_out
+
+def add_lora_layers(model: nn.Module, r: int = 8, lora_alpha: int = 16, lora_dropout: float = 0.1):
+    """Replace linear layers with LoRA versions"""
+    for name, module in model.named_children():
+        if isinstance(module, nn.Linear):
+            setattr(model, name, LoRALinear(module, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout))
+        else:
+            add_lora_layers(module, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+
+def get_lora_params(model: nn.Module):
+    """Get only LoRA parameters for optimization"""
+    params = []
+    for module in model.modules():
+        if isinstance(module, LoRALayer):
+            params.extend([module.lora_A, module.lora_B])
+    return params
+
 @dataclass
 class DataArguments:
-    """
-    Arguments pertaining to which config/tokenizer we are going use.
-    """
     tokenizer_config_type: str = field(
         default='bert-base-uncased',
-        metadata={
-            "help": "bert-base-cased, bert-base-uncased etc"
-        },
+        metadata={"help": "bert-base-cased, bert-base-uncased etc"}
     )
-    data_path: str = field(default='./data/pretrain/', metadata={"help": "data path"})
+    data_path: str = field(
+        default='./data/pretrain/',
+        metadata={"help": "data path"}
+    )
     max_token_length: int = field(
         default=128,
-        metadata={
-            "help": "The maximum total input token length for cell/caption/header after tokenization."
-        },
+        metadata={"help": "Maximum token length for tokenization"}
     )
     max_row_length: int = field(
         default=100,
-        metadata={
-            "help": "The maximum total input rows for a table"
-        },
+        metadata={"help": "Maximum rows per table"}
     )
     max_column_length: int = field(
         default=100,
-        metadata={
-            "help": "The maximum total input columns for a table"
-        },
+        metadata={"help": "Maximum columns per table"}
     )
     num_workers: Optional[int] = field(
         default=8,
-        metadata={"help": "Number of workers for dataloader"},
+        metadata={"help": "Number of workers for dataloader"}
     )
     valid_ratio: float = field(
         default=0.01,
-        metadata={"help": "Validation split ratio"},
+        metadata={"help": "Validation split ratio"}
     )
     seed: int = field(
         default=42,
@@ -74,27 +141,47 @@ class DataArguments:
     )
     max_epoch: int = field(
         default=5,
-        metadata={"help": "Maximum number of training epochs"}
+        metadata={"help": "Maximum training epochs"}
     )
     electra: bool = field(
         default=False,
-        metadata={"help": "Whether to use ELECTRA objective"}
+        metadata={"help": "Use ELECTRA objective"}
     )
     mask_ratio: float = field(
         default=0.15,
-        metadata={"help": "Masking ratio for training"}
+        metadata={"help": "Masking ratio"}
     )
     contrast_bipartite_edge: bool = field(
         default=False,
-        metadata={"help": "Whether to use contrastive bipartite edge objective"}
+        metadata={"help": "Use contrastive edge objective"}
     )
     bipartite_edge_corrupt_ratio: float = field(
         default=0.3,
-        metadata={"help": "Corruption ratio for bipartite edges"}
+        metadata={"help": "Edge corruption ratio"}
     )
     checkpoint_dir: str = field(
         default='checkpoints',
-        metadata={"help": "Directory to save checkpoints"}
+        metadata={"help": "Directory for checkpoints"}
+    )
+    use_lora: bool = field(
+        default=False,
+        metadata={"help": "Whether to use LoRA"}
+    )
+    lora_r: int = field(
+        default=8,
+        metadata={"help": "LoRA rank"}
+    )
+    lora_alpha: int = field(
+        default=16,
+        metadata={"help": "LoRA alpha"}
+    )
+    lora_dropout: float = field(
+        default=0.1,
+        metadata={"help": "LoRA dropout"}
+    )
+    from_scratch: bool = field(
+        default=False,
+        metadata={"help": "Training from scratch"}
     )
 
 @dataclass
@@ -117,7 +204,7 @@ class OptimizerConfig:
     adam_w_mode: bool = True
     save_every_n_epochs: int = field(
         default=1,
-        metadata={"help": "Save checkpoint every N epochs"}
+        metadata={"help": "Save frequency in epochs"}
     )
     save_top_k: int = field(
         default=3,
@@ -125,7 +212,7 @@ class OptimizerConfig:
     )
     checkpoint_path: str = field(
         default="",
-        metadata={"help": "Path to pretrained checkpoint for finetuning"}
+        metadata={"help": "Path to checkpoint for finetuning"}
     )
 
     @classmethod
@@ -146,13 +233,13 @@ class OptimizerConfig:
         optimizer = optim_cls(optim_groups, **kwargs)
         return optimizer
 
-
 class PlModel(pl.LightningModule):
-    def __init__(self, model_config, optimizer_cfg):
+    def __init__(self, model_config, optimizer_cfg, data_args):
         super().__init__()
         self.model = Encoder(model_config)
         self.model_config = model_config
         self.optimizer_cfg = optimizer_cfg
+        self.data_args = data_args
         self.save_hyperparameters()
 
         if self.model_config.electra:
@@ -167,27 +254,24 @@ class PlModel(pl.LightningModule):
         elif self.model_config.contrast_bipartite_edge:
             self.con_loss = ContrastiveLoss(temperature=0.07)
 
-        # Add training time tracking
         self.epoch_start_time = None
         self.epoch_times = []
         self.peak_gpu_memory = 0
-        
+
     def on_train_epoch_start(self):
         self.epoch_start_time = time.time()
-        
+
     def on_train_epoch_end(self):
         epoch_time = time.time() - self.epoch_start_time
         self.epoch_times.append(epoch_time)
         
-        # Log GPU memory usage
         if torch.cuda.is_available():
-            current_gpu_memory = torch.cuda.max_memory_allocated() / (1024**2)  # Convert to MB
+            current_gpu_memory = torch.cuda.max_memory_allocated() / (1024**2)
             self.peak_gpu_memory = max(self.peak_gpu_memory, current_gpu_memory)
             
-            # Additional detailed GPU info if nvidia-smi is available
             if NVIDIA_SMI_AVAILABLE:
                 nvidia_smi.nvmlInit()
-                handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # GPU 0
+                handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
                 info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
                 gpu_util = nvidia_smi.nvmlDeviceGetUtilizationRates(handle)
                 
@@ -199,7 +283,6 @@ class PlModel(pl.LightningModule):
         self.log('epoch_time_seconds', epoch_time)
 
     def on_train_end(self):
-        # Save training statistics
         stats = {
             'training_completed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'average_epoch_time_seconds': sum(self.epoch_times) / len(self.epoch_times),
@@ -216,7 +299,6 @@ class PlModel(pl.LightningModule):
             }
         }
         
-        # Save to checkpoint directory
         stats_path = os.path.join(self.trainer.logger.log_dir, 'training_stats.json')
         with open(stats_path, 'w') as f:
             json.dump(stats, f, indent=2)
@@ -307,20 +389,28 @@ class PlModel(pl.LightningModule):
         self.logger.log_hyperparams(asdict(self.optimizer_cfg))
         
         learning_rate = self.optimizer_cfg.base_learning_rate
-        no_decay = ["bias", "LayerNorm.weight"]
-        params_decay = [
-            p for n, p in self.named_parameters() 
-            if not any(nd in n for nd in no_decay)
-        ]
-        params_nodecay = [
-            p for n, p in self.named_parameters()
-            if any(nd in n for nd in no_decay)
-        ]
-        
-        optim_groups = [
-            {"params": params_decay, "weight_decay": self.optimizer_cfg.weight_decay},
-            {"params": params_nodecay, "weight_decay": 0.0},
-        ]
+
+        if self.data_args.use_lora and not self.data_args.from_scratch:
+            # Only optimize LoRA parameters when using LoRA
+            trainable_params = get_lora_params(self.model)
+            optim_groups = [
+                {"params": trainable_params, "weight_decay": self.optimizer_cfg.weight_decay}
+            ]
+        else:
+            # Regular optimization of all parameters
+            no_decay = ["bias", "LayerNorm.weight"]
+            params_decay = [
+                p for n, p in self.named_parameters() 
+                if not any(nd in n for nd in no_decay)
+            ]
+            params_nodecay = [
+                p for n, p in self.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ]
+            optim_groups = [
+                {"params": params_decay, "weight_decay": self.optimizer_cfg.weight_decay},
+                {"params": params_nodecay, "weight_decay": 0.0},
+            ]
         
         optimizer = self.optimizer_cfg.get_optimizer(optim_groups, learning_rate)
         
@@ -342,6 +432,37 @@ class PlModel(pl.LightningModule):
             "monitor": "validation_loss",
         }]
 
+class CustomCheckpoint(pl.callbacks.Callback):
+    def __init__(self, dirpath, monitor="validation_loss", mode="min"):
+        super().__init__()
+        self.dirpath = dirpath
+        self.monitor = monitor
+        self.mode = mode
+        self.best_metric = float('inf') if mode == "min" else float('-inf')
+        
+        # Create checkpoint directory
+        self.checkpoint_dir = os.path.join(dirpath, 'checkpoint')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        current = trainer.callback_metrics.get(self.monitor)
+        if current is None:
+            return
+        
+        is_better = (self.mode == "min" and current < self.best_metric) or \
+                   (self.mode == "max" and current > self.best_metric)
+        
+        if is_better:
+            self.best_metric = current
+            
+            # Save model state
+            model_path = os.path.join(self.checkpoint_dir, "mp_rank_00_model_states.pt")
+            torch.save(pl_module.model.state_dict(), model_path)
+            
+            # Save optimizer state
+            optim_path = os.path.join(self.checkpoint_dir, "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt")
+            torch.save(trainer.optimizers[0].state_dict(), optim_path)
+
 def main():
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -356,10 +477,8 @@ def main():
     
     data_args, optimizer_cfg, trainer_args = parser.parse_args_into_dataclasses()
     
-    # Create checkpoint directory if it doesn't exist
     os.makedirs(data_args.checkpoint_dir, exist_ok=True)
     
-    # Configure tensorboard logger
     tb_logger = TensorBoardLogger(
         save_dir=data_args.checkpoint_dir,
         name="pretrain",
@@ -375,7 +494,6 @@ def main():
 
     pl.utilities.seed.seed_everything(data_args.seed)
 
-    # Set up tokenizer and model config
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_config_type)
     new_tokens = ['[TAB]', '[HEAD]', '[CELL]', '[ROW]', "scinotexp"]
     tokenizer.add_tokens(new_tokens)
@@ -392,16 +510,10 @@ def main():
     })
     logger.info(f"Model config: {model_config}")
 
-    # Set up data module
-    data_module = TableDataModule(
-        tokenizer=tokenizer,
-        data_args=data_args,
-        seed=data_args.seed,
-        batch_size=optimizer_cfg.batch_size,
-        py_logger=logger,
-        objective='electra' if model_config.electra else 'contrast'
-    )
+    # Create model
+    model_module = PlModel(model_config, optimizer_cfg, data_args)
 
+    # Load checkpoint if specified and apply LoRA if needed
     if optimizer_cfg.checkpoint_path:
         logger.info(f"Loading checkpoint from {optimizer_cfg.checkpoint_path}")
         state_dict = torch.load(optimizer_cfg.checkpoint_path, 
@@ -412,45 +524,75 @@ def main():
                 name = k[13:]  # remove `module.model.`
                 new_state_dict[name] = v
         
-        model_module = PlModel(model_config, optimizer_cfg)
-        model_module.model.load_state_dict(new_state_dict, strict=True)
+        # Load with strict=False to allow missing LoRA parameters
+        model_module.model.load_state_dict(new_state_dict, strict=False)
         
+        # After loading base model weights, apply LoRA if specified
+        if data_args.use_lora and not data_args.from_scratch:
+            logger.info("Applying LoRA adaptation...")
+            add_lora_layers(
+                model_module.model,
+                r=data_args.lora_r,
+                lora_alpha=data_args.lora_alpha,
+                lora_dropout=data_args.lora_dropout
+            )
+            logger.info("LoRA layers added successfully")
+
         # Run initial validation
         logger.info("Running initial validation with loaded checkpoint...")
-        trainer = pl.Trainer.from_argparse_args(
+        validation_trainer = pl.Trainer.from_argparse_args(
             trainer_args,
             strategy="deepspeed_stage_1",
+            callbacks=[],  # No callbacks needed for validation
             logger=tb_logger,
-            precision='bf16',
-            enable_checkpointing=False,  # Disable checkpointing for validation only
             max_epochs=0,  # No training, just validation
+            enable_checkpointing=False,  # Disable checkpointing for validation
+            precision='bf16'
         )
-        trainer.validate(model_module, datamodule=data_module)
-    else:
-        model_module = PlModel(model_config, optimizer_cfg)
+        
+        # Set up data module for validation
+        data_module = TableDataModule(
+            tokenizer=tokenizer,
+            data_args=data_args,
+            seed=data_args.seed,
+            batch_size=optimizer_cfg.batch_size,
+            py_logger=logger,
+            objective='electra' if model_config.electra else 'contrast'
+        )
+        data_module.setup('validate')
+        
+        validation_results = validation_trainer.validate(model_module, datamodule=data_module)
+        logger.info(f"Initial validation results: {validation_results}")
 
-    # Configure callbacks
+    # Set up data module (for training)
+    data_module = TableDataModule(
+        tokenizer=tokenizer,
+        data_args=data_args,
+        seed=data_args.seed,
+        batch_size=optimizer_cfg.batch_size,
+        py_logger=logger,
+        objective='electra' if model_config.electra else 'contrast'
+    )
+
+    # Configure callbacks with simplified checkpoint system
+    checkpoint_dir = os.path.join(data_args.checkpoint_dir)
     callbacks = [
-        pl.callbacks.ModelCheckpoint(
-            dirpath=os.path.join(data_args.checkpoint_dir, 'checkpoints'),
-            filename='{epoch:02d}-{validation_loss:.4f}',
-            save_top_k=optimizer_cfg.save_top_k,
-            every_n_epochs=optimizer_cfg.save_every_n_epochs,
+        CustomCheckpoint(
+            dirpath=checkpoint_dir,
             monitor="validation_loss" if data_args.contrast_bipartite_edge else "val_f1",
-            mode="min" if data_args.contrast_bipartite_edge else "max",
-            save_last=True,
+            mode="min" if data_args.contrast_bipartite_edge else "max"
         ),
         pl.callbacks.LearningRateMonitor(logging_interval="step"),
         pl.callbacks.RichProgressBar(),
     ]
-
-    # Add memory tracking callback
-    class MemoryTracker(pl.callbacks.Callback):
-        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
     
-    callbacks.append(MemoryTracker())
+    # Configure logger to save directly to checkpoint_dir
+    tb_logger = TensorBoardLogger(
+        save_dir=checkpoint_dir,
+        name=None,  # This prevents creation of "pretrain" subdirectory
+        version='',  # This prevents creation of version subdirectories
+        default_hp_metric=False  # This prevents creation of hparams.yaml
+    )
 
     # Configure training
     if trainer_args.gpus == -1:
